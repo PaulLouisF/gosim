@@ -1,0 +1,32 @@
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+chroma_db/
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Obsidian vault data (generated, large)
+**/obsidian-vault/wiki/
+**/obsidian-vault/raw/
+**/obsidian-vault/uploads/
+**/obsidian-vault/.obsidian/
+
+# OS
+.DS_Store
+Thumbs.db
