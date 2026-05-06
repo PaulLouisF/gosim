@@ -2,7 +2,7 @@
 
 Live video: https://youtu.be/rivUuRjcgS0
 
-A domain-agnostic conversational agent that researches any topic, compiles a living knowledge wiki in Obsidian, and teaches through Socratic voice interaction.
+A domain-agnostic conversational agent that researches any topic, compiles a living knowledge wiki in Obsidian, and teaches through Socratic voice interaction. The agent can also modify the knowledge in obsidian by voice or text.
 
 Built for **GOSIM Agentic Hackathon 2026 · STATION F, Paris**.
 
