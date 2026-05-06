@@ -1,5 +1,7 @@
 # Sensei Wiki
 
+Live video: https://youtu.be/rivUuRjcgS0
+
 A domain-agnostic conversational agent that researches any topic, compiles a living knowledge wiki in Obsidian, and teaches through Socratic voice interaction.
 
 Built for **GOSIM Agentic Hackathon 2026 · STATION F, Paris**.
