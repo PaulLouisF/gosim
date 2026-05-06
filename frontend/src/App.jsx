@@ -14,17 +14,16 @@ function browserSpeak(text) {
   if (!text || !window.speechSynthesis) return
   window.speechSynthesis.cancel()
   const utt = new SpeechSynthesisUtterance(text)
+  utt.lang = "en-US"
   utt.rate = 1.05
   utt.pitch = 1.0
   window.speechSynthesis.speak(utt)
 }
 
-function playAudioOrFallback(arrayBuffer, fallbackText) {
+function playAudioOrFallback(arrayBuffer) {
   if (arrayBuffer && arrayBuffer.byteLength > 0) {
     const blob = new Blob([arrayBuffer], { type: "audio/mpeg" })
     new Audio(URL.createObjectURL(blob)).play()
-  } else if (fallbackText) {
-    browserSpeak(fallbackText)
   }
 }
 
@@ -65,8 +64,11 @@ export default function App() {
           }
           return [...prev, data.step]
         })
-        // Auto-clear panel 2s after the compile step finishes
-        if (data.step.type === "compile" && data.step.status === "done") {
+      // Auto-clear panel after compile or tutor step finishes
+        if (
+          (data.step.type === "compile" || data.step.type === "tutor") &&
+          data.step.status === "done"
+        ) {
           setTimeout(() => setReasoning([]), 2000)
         }
       }
@@ -150,7 +152,7 @@ export default function App() {
         setActiveQuestion({ id: questionId, concept, text })
       }
 
-      playAudioOrFallback(response.data, text)
+      playAudioOrFallback(response.data)
     } catch (err) {
       console.error("Message error:", err)
       addMessage("agent", "Something went wrong. Please try again.")
@@ -170,13 +172,27 @@ export default function App() {
 
       const text = response.headers?.["x-text"]
       const score = response.headers?.["x-score"]
+      const questionId = response.headers?.["x-question-id"]
+      const concept = response.headers?.["x-concept"]
 
-      if (text) {
-        addMessage("agent", text, "answer", { score })
-        playAudioOrFallback(response.data, text)
+      // Show score feedback as a brief standalone message
+      if (score) {
+        const scoreLabel = score === "strong" ? "✓ Correct!" :
+                           score === "partial" ? "~ Partial" : "✗ Missed"
+        addMessage("agent", scoreLabel, "answer", { score })
       }
 
-      setActiveQuestion(null)
+      if (text) {
+        // Next question — plain message (no score badge); final synthesis — no questionId
+        addMessage("agent", text, "text", null)
+        playAudioOrFallback(response.data)
+      }
+
+      if (questionId) {
+        setActiveQuestion({ id: questionId, concept, text })
+      } else {
+        setActiveQuestion(null)
+      }
     } catch (err) {
       console.error("Answer error:", err)
     }

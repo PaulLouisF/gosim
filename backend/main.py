@@ -15,26 +15,36 @@ load_dotenv()
 
 
 def hv(text: str) -> str:
-    """Sanitize a string for use as an HTTP header value (no newlines, ASCII only)."""
+    """Sanitize a string for use as an HTTP header value (latin-1, no newlines)."""
     if not text:
         return ""
-    return text.replace("\r", " ").replace("\n", " ").encode("ascii", errors="replace").decode("ascii")[:500]
+    text = text.replace("\r", " ").replace("\n", " ")
+    return text.encode("latin-1", errors="replace").decode("latin-1")
 
+import re
 from wiki.manager import (init_vault, list_wiki_pages, read_wiki_page,
-                           delete_wiki_page, delete_source_from_page, append_log)
+                           delete_wiki_page, delete_source_from_page,
+                           append_log, get_index_content, rebuild_index,
+                           WIKI_PATH)
 from orchestrator.router import detect_intent
-from agents.research_agent import research_topic, ingest_uploaded_file
+from agents.research_agent import research_topic, ingest_uploaded_file, create_source_from_text
 from agents.evaluator_agent import evaluate_sources, summarize_evaluation
 from agents.compiler_agent import compile_topic
 from agents.tutor_agent import generate_question, assess_answer, generate_study_plan, generate_debrief
 from agents.note_agent import handle_note
-from retrieval.rag import index_wiki, retrieve_from_wiki, should_use_rag
+from agents.answer_agent import answer_query
+from retrieval.rag import index_wiki, retrieve_from_wiki
 from services.speechmatics_tts import speak
 from services.zai_client import zai_complete
 from models.schemas import (VoiceMessage, AnswerRequest, NoteRequest,
                              TTSRequest, SessionConfig)
 
 init_vault()
+# Rebuild index with summaries so queries work immediately after restart
+try:
+    rebuild_index()
+except Exception:
+    pass
 
 app = FastAPI(title="Sensei Wiki API")
 app.add_middleware(
@@ -116,7 +126,10 @@ async def start_session():
         "gaps": [],
         "questions": [],
         "question_index": 0,
-        "sources": []
+        "sources": [],
+        "quiz_queue": [],     # concepts remaining in active quiz
+        "quiz_answered": 0,   # main questions answered so far
+        "quiz_total": 0,      # total main questions in this quiz
     }
     return {"session_id": session_id}
 
@@ -183,8 +196,13 @@ async def _handle_message_inner(session_id: str, s: dict, transcript: str) -> Re
 
         await emit(session_id, "research", "Activating ResearchAgent...",
                    f"Querying Tavily for '{topic}'")
-        sources = await research_topic(topic, cfg.num_sources, cfg.search_depth)
-        await emit(session_id, "research", f"Found {len(sources)} sources", None, "done")
+        if intent_result.raw_content:
+            # User pasted raw text — use it as a source directly, skip Tavily
+            sources = [create_source_from_text(topic, intent_result.raw_content)]
+            await emit(session_id, "research", "Using user-provided content as source", None, "done")
+        else:
+            sources = await research_topic(topic, cfg.num_sources, cfg.search_depth)
+            await emit(session_id, "research", f"Found {len(sources)} sources", None, "done")
 
         await emit(session_id, "evaluate", "Activating EvaluatorAgent...",
                    "Scoring source credibility and corroboration")
@@ -197,8 +215,7 @@ async def _handle_message_inner(session_id: str, s: dict, transcript: str) -> Re
         pages = await compile_topic(topic, sources, evaluated)
         s["sources"] = sources
 
-        if should_use_rag():
-            index_wiki()
+        index_wiki()
 
         await emit(session_id, "compile",
                    f"Created {len(pages)} wiki pages",
@@ -210,12 +227,8 @@ async def _handle_message_inner(session_id: str, s: dict, transcript: str) -> Re
             "sources": [src.dict() for src in sources]
         })
 
-        tts_text = (f"I've researched {topic} and built your knowledge base "
-                    f"with {len(pages)} concept pages from "
-                    f"{len(evaluated['usable'])} verified sources. "
-                    f"Ask me anything, say quiz me, or add a note.")
-        audio = await speak(tts_text)
-        return Response(content=audio, media_type="audio/mpeg",
+        tts_text = f"Research complete. {len(pages)} pages ready."
+        return Response(content=b"", media_type="audio/mpeg",
                         headers={"X-Text": hv(tts_text),
                                  "X-Pages": str(len(pages)),
                                  "X-Sources": str(len(evaluated["usable"]))})
@@ -224,38 +237,70 @@ async def _handle_message_inner(session_id: str, s: dict, transcript: str) -> Re
     elif intent_result.intent == "query":
         await emit(session_id, "orchestrator", f"Querying wiki for: {transcript}")
 
-        if should_use_rag():
-            chunks = retrieve_from_wiki(transcript, n=3)
-            context = "\n\n".join([c["text"][:500] for c in chunks])
-            min_conf = min([c["confidence"] for c in chunks], default=0.5)
-        else:
-            index = list_wiki_pages()
-            relevant_pages = index[:5]
-            context_parts = []
-            for p in relevant_pages:
+        # ── Karpathy LLM Wiki pattern ──────────────────────────────────────────
+        # Step 1: read index.md to get the full catalog of pages + summaries
+        index_content = get_index_content()
+
+        if not index_content.strip() or "No pages yet" in index_content:
+            msg_text = "No knowledge base yet. Tell me a topic to research first."
+            return Response(content=b"", media_type="audio/mpeg",
+                            headers={"X-Text": hv(msg_text)})
+
+        # Step 2: ask the LLM which pages are relevant (fast lookup, no embeddings)
+        PAGE_SELECT_SYSTEM = (
+            "You are a wiki librarian. Given an index of wiki pages and a question, "
+            "return ONLY a comma-separated list of the most relevant page filenames "
+            "(without .md extension). Return at most 4 filenames. No explanation, no prose."
+        )
+        page_select_prompt = (
+            f"Wiki index:\n{index_content}\n\n"
+            f"Question: {transcript}\n\n"
+            f"Return the filenames of the most relevant pages (comma-separated, no .md, no spaces around commas):"
+        )
+        selected_raw = await zai_complete(
+            page_select_prompt, system=PAGE_SELECT_SYSTEM,
+            max_tokens=80, temperature=0.0
+        )
+        # Strip any thinking/prose the model might prepend
+        selected_raw = re.sub(r'(?i)^(thinking:|the most relevant|here are|pages?:).*?\n', '', selected_raw.strip())
+        selected_names = [n.strip().strip('"\'') for n in selected_raw.split(",") if n.strip()]
+        await emit(session_id, "orchestrator",
+                   f"Reading pages: {', '.join(selected_names[:3])}")
+
+        # Step 3: read the selected pages — cap each at 800 chars to keep prompt small
+        context_parts = []
+        confidences = []
+        for name in selected_names[:3]:
+            concept_guess = name.replace("_", " ")
+            content = read_wiki_page(concept_guess)
+            if not content:
+                filepath = WIKI_PATH / (name + ".md")
+                if filepath.exists():
+                    content = filepath.read_text(encoding="utf-8")
+            if content:
+                body = re.sub(r'^---.*?---\s*', '', content, flags=re.DOTALL).strip()
+                context_parts.append(f"## {concept_guess}\n\n{body[:800]}")
+                conf_match = re.search(r'^confidence:\s*(.+)$', content, re.MULTILINE)
+                if conf_match:
+                    confidences.append(float(conf_match.group(1).strip()))
+
+        # Fallback: if no pages found, load all pages (trimmed)
+        if not context_parts:
+            all_pages = list_wiki_pages()
+            for p in all_pages:
                 content = read_wiki_page(p["concept"])
                 if content:
-                    context_parts.append(content[:400])
-            context = "\n\n".join(context_parts)
-            min_conf = min([p["confidence"] for p in relevant_pages], default=0.5)
+                    body = re.sub(r'^---.*?---\s*', '', content, flags=re.DOTALL).strip()
+                    context_parts.append(f"## {p['concept']}\n\n{body[:600]}")
+                    confidences.append(p["confidence"])
 
-        caveat = ""
-        if min_conf < 0.50:
-            caveat = "Note: some of my knowledge on this has low confidence. "
-        elif min_conf < 0.80:
-            caveat = "Based on moderately confident sources: "
+        context = "\n\n---\n\n".join(context_parts)
 
-        QUERY_SYSTEM = """You are Sensei, answering from your compiled wiki only.
-Be precise and cite which concepts your answer draws from.
-If the answer isn't in your wiki, say so explicitly — never hallucinate."""
-
-        prompt = f"Wiki context:\n{context}\n\nQuestion: {transcript}"
-        answer = await zai_complete(prompt, system=QUERY_SYSTEM, max_tokens=300)
-        full_answer = caveat + answer
+        # Step 4: answer via MiniMax (follows instructions reliably)
+        full_answer = await answer_query(transcript, context)
 
         await emit(session_id, "orchestrator", "Answer ready", None, "done")
-        audio = await speak(full_answer)
-        return Response(content=audio, media_type="audio/mpeg",
+        return Response(content=b"", media_type="audio/mpeg",
                         headers={"X-Text": hv(full_answer)})
 
     # ── QUIZ ──────────────────────────────────────────────────────────────────
@@ -263,24 +308,60 @@ If the answer isn't in your wiki, say so explicitly — never hallucinate."""
         pages = list_wiki_pages()
         if not pages:
             msg_text = "No knowledge base yet. Tell me a topic to research first."
-            audio = await speak(msg_text)
-            return Response(content=audio, media_type="audio/mpeg",
+            return Response(content=b"", media_type="audio/mpeg",
                             headers={"X-Text": hv(msg_text)})
 
-        idx = s["question_index"] % len(pages)
-        concept = pages[idx]["concept"]
+        # Filter to topic if specified ("quiz me about type 1 diabetes")
+        quiz_topic = intent_result.topic
+        if quiz_topic:
+            lower_topic = quiz_topic.lower().strip()
+            # Try exact substring match first (most precise)
+            exact = [p for p in pages if lower_topic in p["concept"].lower()]
+            if exact:
+                pages = exact
+            else:
+                # Fall back: ALL non-trivial words must appear in concept name
+                topic_words = [w for w in lower_topic.split() if len(w) > 2]
+                broad = [p for p in pages if all(w in p["concept"].lower() for w in topic_words)]
+                if broad:
+                    pages = broad
 
-        await emit(session_id, "tutor", f"Generating question on: {concept}")
-        question = await generate_question(concept, [p["concept"] for p in pages])
-        s["questions"].append(question)
-        s["question_index"] += 1
+        # Build a queue of 4 distinct concepts
+        N = 4
+        start = s["question_index"] % len(pages)
+        concepts = [pages[(start + i) % len(pages)]["concept"] for i in range(N)]
+        s["question_index"] += N
 
-        await emit(session_id, "tutor", "Question ready", None, "done")
-        audio = await speak(question["text"])
+        # Store remaining concepts in queue; ask first one now
+        first_concept = concepts[0]
+        s["quiz_queue"] = concepts[1:]
+        s["quiz_answered"] = 0
+        s["quiz_total"] = N
+        s["gaps"] = []  # reset gaps for fresh quiz session
+
+        # Pre-generate all 4 questions in parallel — Q2/Q3/Q4 are ready instantly
+        all_concept_names = [p["concept"] for p in pages]
+        import asyncio as _asyncio
+        await emit(session_id, "tutor", f"Generating {N} questions in parallel...")
+        all_questions = list(await _asyncio.gather(*[
+            generate_question(c, all_concept_names) for c in concepts
+        ]))
+        # Number them and store
+        for i, q in enumerate(all_questions):
+            q["quiz_number"] = i + 1
+        s["questions"].extend(all_questions)
+        s["quiz_queue"] = [q["id"] for q in all_questions[1:]]  # IDs of Q2..Q4
+        s["quiz_answered"] = 0
+        s["quiz_total"] = N
+        s["gaps"] = []
+
+        first_q = all_questions[0]
+        await emit(session_id, "tutor", "Questions ready", None, "done")
+        audio = await speak(first_q["text"])
         return Response(content=audio, media_type="audio/mpeg",
-                        headers={"X-Text": hv(question["text"]),
-                                 "X-Question-Id": question["id"],
-                                 "X-Concept": concept})
+                        headers={"X-Text": hv(f"Question 1/{N}: {first_q['text']}"),
+                                 "X-Question-Id": first_q["id"],
+                                 "X-Concept": hv(first_concept)})
 
     # ── ADD NOTE ──────────────────────────────────────────────────────────────
     elif intent_result.intent == "add_note":
@@ -290,8 +371,7 @@ If the answer isn't in your wiki, say so explicitly — never hallucinate."""
         await emit(session_id, "note", f"Note added to: {result['concept']}", None, "done")
         await ws_manager.send(session_id, {"event": "wiki_updated"})
         msg_text = f"Note added to {result['concept']}."
-        audio = await speak(msg_text)
-        return Response(content=audio, media_type="audio/mpeg",
+        return Response(content=b"", media_type="audio/mpeg",
                         headers={"X-Text": hv(msg_text)})
 
     # ── STUDY PLAN ────────────────────────────────────────────────────────────
@@ -299,12 +379,28 @@ If the answer isn't in your wiki, say so explicitly — never hallucinate."""
         topic = s.get("topic", "your topic")
         await emit(session_id, "tutor", "Generating study plan...")
         plan = await generate_study_plan(topic, s["gaps"])
-        debrief = await generate_debrief(topic, plan)
         await emit(session_id, "tutor", "Study plan ready", None, "done")
         await ws_manager.send(session_id, {"event": "study_plan", "plan": plan})
-        audio = await speak(debrief)
-        return Response(content=audio, media_type="audio/mpeg",
-                        headers={"X-Text": hv(debrief)})
+
+        # Build a readable text synthesis — no TTS for long content
+        strong = plan.get("strong_concepts", [])
+        gaps = plan.get("gaps", [])
+        lines = [plan.get("overall_assessment", "")]
+        if strong:
+            lines.append(f"Strong: {', '.join(strong)}.")
+        if gaps:
+            critical = [g["concept"] for g in gaps if g.get("severity") == "critical"]
+            moderate = [g["concept"] for g in gaps if g.get("severity") == "moderate"]
+            if critical:
+                lines.append(f"Must review: {', '.join(critical)}.")
+            if moderate:
+                lines.append(f"Also review: {', '.join(moderate)}.")
+            order = plan.get("study_order", [])
+            if order:
+                lines.append(f"Study order: {' → '.join(order)}.")
+        synthesis = " ".join(l for l in lines if l)
+        return Response(content=b"", media_type="audio/mpeg",
+                        headers={"X-Text": hv(synthesis)})
 
     # ── REVIEW SOURCES ────────────────────────────────────────────────────────
     elif intent_result.intent == "review_sources":
@@ -315,8 +411,7 @@ If the answer isn't in your wiki, say so explicitly — never hallucinate."""
         })
         msg_text = (f"Showing {len(sources)} sources in the panel. "
                     f"Say 'remove' followed by the source name to delete one.")
-        audio = await speak(msg_text)
-        return Response(content=audio, media_type="audio/mpeg",
+        return Response(content=b"", media_type="audio/mpeg",
                         headers={"X-Text": hv(msg_text)})
 
     # ── REMOVE SOURCE ─────────────────────────────────────────────────────────
@@ -337,8 +432,7 @@ If the answer isn't in your wiki, say so explicitly — never hallucinate."""
 
             s["sources"] = [src for src in sources if src.id != match.id]
 
-            if should_use_rag():
-                index_wiki()
+            index_wiki()
 
             await ws_manager.send(session_id, {
                 "event": "source_removed",
@@ -351,17 +445,13 @@ If the answer isn't in your wiki, say so explicitly — never hallucinate."""
         else:
             msg_text = f"I couldn't find a source matching '{ref}'. Try saying the exact title."
 
-        audio = await speak(msg_text)
-        return Response(content=audio, media_type="audio/mpeg",
+        return Response(content=b"", media_type="audio/mpeg",
                         headers={"X-Text": hv(msg_text)})
-
-    # ── OPEN SOURCE ───────────────────────────────────────────────────────────
     elif intent_result.intent == "open_source":
         ref = intent_result.source_ref or ""
         sources = s.get("sources", [])
         match = next((src for src in sources
                       if ref.lower() in src.title.lower()), None)
-
         if match:
             await ws_manager.send(session_id, {
                 "event": "open_source",
@@ -373,16 +463,14 @@ If the answer isn't in your wiki, say so explicitly — never hallucinate."""
         else:
             msg_text = "I couldn't find that source."
 
-        audio = await speak(msg_text)
-        return Response(content=audio, media_type="audio/mpeg",
+        return Response(content=b"", media_type="audio/mpeg",
                         headers={"X-Text": hv(msg_text)})
 
     # ── DEFAULT ───────────────────────────────────────────────────────────────
     else:
         fallback = ("I didn't understand that. You can say: learn about a topic, "
                     "quiz me, add a note, review sources, or ask me a question.")
-        audio = await speak(fallback)
-        return Response(content=audio, media_type="audio/mpeg",
+        return Response(content=b"", media_type="audio/mpeg",
                         headers={"X-Text": hv(fallback)})
 
 
@@ -398,6 +486,9 @@ async def submit_answer(session_id: str, req: AnswerRequest):
         raise HTTPException(404, "Question not found")
 
     assessment = await assess_answer(question, req.answer)
+    is_main = question.get("is_main", True)
+    is_followup = question.get("is_followup", False)
+
     s["gaps"].append({
         "concept": question["concept"],
         "score": assessment["score"],
@@ -413,15 +504,81 @@ async def submit_answer(session_id: str, req: AnswerRequest):
         "gaps": s["gaps"]
     })
 
-    response_text = None
-    if assessment.get("followup_question"):
-        response_text = assessment["followup_question"]
-    elif assessment["score"] == "strong":
-        response_text = "Correct. " + (assessment.get("feedback_internal", ""))
+    # Count main questions answered
+    if is_main:
+        s["quiz_answered"] = s.get("quiz_answered", 0) + 1
 
-    if response_text:
-        audio = await speak(response_text)
+    quiz_answered = s.get("quiz_answered", 0)
+    quiz_total = s.get("quiz_total", 0)
+    quiz_queue = s.get("quiz_queue", [])
+
+    # Give one follow-up on missed/partial (only for main questions, not for follow-ups)
+    followup_text = assessment.get("followup_question")
+    if followup_text and is_main and not is_followup:
+        followup_q = {
+            "id": str(uuid.uuid4())[:8],
+            "concept": question["concept"],
+            "text": followup_text,
+            "wiki_content": question.get("wiki_content", ""),
+            "is_main": False,
+            "is_followup": True,
+        }
+        s["questions"].append(followup_q)
+        audio = await speak(followup_text)
         return Response(content=audio, media_type="audio/mpeg",
+                        headers={"X-Text": hv(followup_text),
+                                 "X-Score": assessment["score"],
+                                 "X-Question-Id": followup_q["id"],
+                                 "X-Concept": hv(question["concept"])})
+
+    # Move to next pre-generated question
+    if quiz_queue:
+        next_id = quiz_queue.pop(0)
+        s["quiz_queue"] = quiz_queue
+        next_q = next((q for q in s["questions"] if q["id"] == next_id), None)
+        if next_q:
+            q_num = quiz_answered + 1
+            audio = await speak(next_q["text"])
+            return Response(content=audio, media_type="audio/mpeg",
+                            headers={"X-Text": hv(f"Question {q_num}/{quiz_total}: {next_q['text']}"),
+                                     "X-Score": assessment["score"],
+                                     "X-Question-Id": next_q["id"],
+                                     "X-Concept": hv(next_q["concept"])})
+
+    # Quiz complete — generate synthesis
+    if quiz_total > 0 and quiz_answered >= quiz_total:
+        topic = s.get("topic", "the topic")
+        plan = await generate_study_plan(topic, s["gaps"])
+        await ws_manager.send(session_id, {"event": "study_plan", "plan": plan})
+
+        strong = plan.get("strong_concepts", [])
+        gaps = plan.get("gaps", [])
+        correct = sum(1 for g in s["gaps"] if g["score"] == "strong")
+        lines = [f"Quiz complete! {correct}/{quiz_total} correct."]
+        lines.append(plan.get("overall_assessment", ""))
+        if strong:
+            lines.append(f"Strong: {', '.join(strong)}.")
+        critical = [g["concept"] for g in gaps if g.get("severity") == "critical"]
+        moderate = [g["concept"] for g in gaps if g.get("severity") == "moderate"]
+        if critical:
+            lines.append(f"Must review: {', '.join(critical)}.")
+        if moderate:
+            lines.append(f"Also review: {', '.join(moderate)}.")
+        synthesis = " ".join(l for l in lines if l)
+
+        # Reset quiz state
+        s["quiz_queue"] = []
+        s["quiz_total"] = 0
+        s["quiz_answered"] = 0
+
+        return Response(content=b"", media_type="audio/mpeg",
+                        headers={"X-Text": hv(synthesis),
+                                 "X-Score": assessment["score"]})
+
+    # Fallback (single-question mode, no active quiz session)
+    if assessment["score"] == "strong":
+        response_text = "Correct."
+        return Response(content=b"", media_type="audio/mpeg",
                         headers={"X-Text": hv(response_text),
                                  "X-Score": assessment["score"]})
 

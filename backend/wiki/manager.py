@@ -84,6 +84,45 @@ def append_note_to_page(concept: str, note: str, source: str = "voice_note") -> 
     return True
 
 
+def insert_into_section(concept: str, section: str, text: str) -> bool:
+    """Insert text at the end of a named section in a wiki page.
+    Falls back to append if section not found."""
+    content = read_wiki_page(concept)
+    if not content:
+        return False
+    filename = concept_to_filename(concept)
+    filepath = WIKI_PATH / filename
+
+    # Find the heading line (## Section or ### Section, case-insensitive)
+    lines = content.split("\n")
+    insert_at = None
+    section_lower = section.lower().strip()
+    for i, line in enumerate(lines):
+        if re.match(r"^#{1,4}\s+", line):
+            heading_text = re.sub(r"^#{1,4}\s+", "", line).strip().lower()
+            if heading_text == section_lower:
+                insert_at = i
+                break
+
+    if insert_at is None:
+        # Section not found — append to end
+        return append_note_to_page(concept, text)
+
+    # Find the end of this section (next heading or EOF)
+    end_at = len(lines)
+    for i in range(insert_at + 1, len(lines)):
+        if re.match(r"^#{1,4}\s+", lines[i]):
+            end_at = i
+            break
+
+    # Insert a clean sentence at the end of the section (before the next heading)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines.insert(end_at, f"\n{text}  *(added {timestamp})*\n")
+    filepath.write_text("\n".join(lines), encoding="utf-8")
+    append_log(f"section_edit | {concept} | {section} | {text[:60]}")
+    return True
+
+
 def delete_source_from_page(concept: str, source_url: str) -> bool:
     """Remove a source reference from a wiki page frontmatter."""
     content = read_wiki_page(concept)
@@ -128,26 +167,38 @@ def list_wiki_pages() -> list[dict]:
     return pages
 
 
+def _extract_summary(content: str) -> str:
+    """Extract a one-line summary from wiki page content (skip frontmatter + headers)."""
+    # Strip YAML frontmatter
+    body = re.sub(r'^---.*?---\s*', '', content, flags=re.DOTALL).strip()
+    for line in body.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and not line.startswith('[[') and len(line) > 20:
+            return line[:160].rstrip('.,;') + '.'
+    return ""
+
+
 def rebuild_index():
-    """Rebuild index.md from current wiki pages."""
+    """Rebuild index.md with rich per-page summaries for the Karpathy LLM Wiki pattern."""
     pages = list_wiki_pages()
-    lines = ["# Sensei Wiki — Index\n",
-             f"*Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n",
-             f"*{len(pages)} concept pages*\n\n"]
+    lines = [
+        "# Sensei Wiki — Index\n\n",
+        f"*Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}*  \n",
+        f"*{len(pages)} concept pages*\n\n",
+        "---\n\n",
+    ]
 
-    for tier_label, tier_val in [
-        ("🟢 High Confidence", "high"),
-        ("🟡 Medium Confidence", "medium"),
-        ("🔴 Low Confidence", "low"),
-    ]:
-        tier_pages = [p for p in pages if p["tier"] == tier_val]
-        if tier_pages:
-            lines.append(f"## {tier_label}\n")
-            for p in sorted(tier_pages, key=lambda x: x["concept"]):
-                fn = concept_to_filename(p["concept"])
-                lines.append(f"- [[{fn[:-3]}]] — confidence: {p['confidence']:.2f}\n")
-            lines.append("\n")
+    # Group by topic prefix if page names share a common parenthetical topic
+    # Otherwise list all pages with summaries
+    for p in sorted(pages, key=lambda x: x["concept"]):
+        fn_stem = concept_to_filename(p["concept"])[:-3]  # strip .md
+        raw_content = read_wiki_page(p["concept"]) or ""
+        summary = _extract_summary(raw_content)
+        tier_icon = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(p["tier"], "⚪")
+        summary_str = f" — {summary}" if summary else ""
+        lines.append(f"- [[{fn_stem}]] {tier_icon}{summary_str}\n")
 
+    lines.append("\n")
     (WIKI_PATH / "index.md").write_text("".join(lines), encoding="utf-8")
 
 

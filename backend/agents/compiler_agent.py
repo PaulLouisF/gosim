@@ -40,20 +40,22 @@ Related concepts: {related}
 Source material:
 {sources_text}
 
-Write a comprehensive wiki page for "{concept}" that:
-1. Defines the concept clearly and precisely
-2. Explains mechanisms, causes, or principles
-3. Covers key facts, classifications, or variations
-4. Connects to related concepts using [[wikilinks]] like [[related concept]]
-5. Highlights what is most important to understand
+Output ONLY the raw markdown for the wiki page — no JSON wrapper, no preamble, no reasoning, no checklist.
+Start immediately with the concept title as a level-2 heading.
 
-Use markdown with clear headers (##, ###).
-Be dense with information but readable.
-Write 400-700 words.
-Every important term that has its own concept page should be [[wikilinked]].
+Use this exact structure:
+## {concept}
 
-IMPORTANT: Only state things that are supported by the provided source material.
-If sources conflict, note the contradiction explicitly."""
+### Overview
+[2-3 sentence definition using only information from the source material]
+
+### Key Facts
+[dense, well-organised paragraphs using ## / ### subheadings as needed; 300-600 words total]
+
+### Related Concepts
+[1-2 sentences connecting to related topics using [[wikilinks]] like [[related concept]]]
+
+Write 400-700 words total. Only state things supported by the source material."""
 
 UPDATE_PROMPT = """You are updating an existing wiki page with new information.
 
@@ -63,14 +65,42 @@ Existing page:
 New source material:
 {new_sources_text}
 
-Update the page to incorporate new information:
-- Add any new facts not already covered
-- Update any outdated information
-- Note any contradictions between old and new sources
-- Keep [[wikilinks]] intact
-- Update the confidence assessment if needed
+Output ONLY the complete updated markdown — no JSON wrapper, no preamble, no reasoning.
+Start immediately with the first heading of the page.
+Keep [[wikilinks]] intact. Incorporate new facts and correct outdated information."""
 
-Return the complete updated page content (no frontmatter)."""
+
+def _clean_wiki_content(text: str) -> str:
+    """Strip reasoning preambles, JSON wrappers, and trailing review text from model output."""
+    text = text.strip()
+
+    # Extract content from JSON wrapper if model returned {"content": "...", ...}
+    if text.startswith("{") or "```json" in text:
+        # Try extracting a markdown/content field from JSON
+        for key in ("markdown", "content", "wiki_content", "page"):
+            pattern = rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"'
+            m = re.search(pattern, text, re.DOTALL)
+            if m:
+                text = m.group(1).replace("\\n", "\n").replace('\\"', '"').strip()
+                break
+        else:
+            # Try stripping ```json fences
+            text = re.sub(r"```(?:json)?\s*\{.*?\}\s*```", "", text, flags=re.DOTALL).strip()
+
+    # Strip reasoning preamble — everything before the first markdown heading
+    heading_match = re.search(r"^#{1,3} ", text, re.MULTILINE)
+    if heading_match and heading_match.start() > 0:
+        text = text[heading_match.start():]
+
+    # Strip trailing review / verification paragraphs
+    # These typically start with "I should verify", "Let me verify", "Note:", "I need to"
+    text = re.sub(
+        r"\n+(I should verify|Let me verify|I need to|Note that|I've connected|"
+        r"I should note|Now let me|I'll also|Let me also|I should also)[^\n]*(\n[^\n#].*)*$",
+        "", text, flags=re.IGNORECASE
+    ).strip()
+
+    return text
 
 
 async def plan_concepts(topic: str) -> list[dict]:
@@ -121,7 +151,8 @@ async def compile_concept_page(concept: str, topic: str,
         related=", ".join(related[:5]),
         sources_text="\n---\n".join(sources_text_parts)
     )
-    return await minimax_complete(prompt, max_tokens=1000)
+    result = await minimax_complete(prompt, max_tokens=1000)
+    return _clean_wiki_content(result)
 
 
 async def update_concept_page(concept: str, existing_content: str,
@@ -135,7 +166,8 @@ async def update_concept_page(concept: str, existing_content: str,
         existing_content=existing_content,
         new_sources_text=sources_text
     )
-    return await minimax_complete(prompt, max_tokens=1000)
+    result = await minimax_complete(prompt, max_tokens=1000)
+    return _clean_wiki_content(result)
 
 
 async def compile_topic(topic: str, sources: list[Source],

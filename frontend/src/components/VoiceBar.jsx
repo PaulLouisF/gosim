@@ -109,8 +109,8 @@ export default function VoiceBar({ onTranscript }) {
           value={textInput}
           onChange={e => setTextInput(e.target.value)}
           placeholder="Or type here and press Enter..."
-          className="flex-1 h-9 rounded-lg border border-white/10 bg-white/3
-                     px-3 text-sm text-white placeholder-white/20
+          className="flex-1 h-9 rounded-lg border border-white/10 bg-[#1a1a2e]
+                     px-3 text-sm text-white placeholder-white/30
                      focus:outline-none focus:border-violet-500/50"
         />
         <button

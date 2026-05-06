@@ -78,6 +78,21 @@ async def research_topic(topic: str, num_sources: int = 5,
     return sources
 
 
+def create_source_from_text(title: str, text: str) -> Source:
+    """Create a Source object from user-pasted raw text."""
+    source_id = str(uuid.uuid4())[:8]
+    return Source(
+        id=source_id,
+        title=title,
+        credibility_score=0.85,
+        corroboration_score=0.75,
+        final_confidence=0.85,
+        confidence_tier=get_confidence_tier(0.85),
+        scraped_at=datetime.now().isoformat(),
+        content_preview=text[:4000],
+    )
+
+
 async def ingest_uploaded_file(file_path: str, filename: str) -> Source:
     """Ingest a manually uploaded document."""
     source_id = str(uuid.uuid4())[:8]

@@ -63,6 +63,7 @@ class IntentResult(BaseModel):
     config_key: Optional[str] = None
     config_value: Optional[Any] = None
     confidence: float
+    raw_content: Optional[str] = None  # user-pasted text to ingest directly
 
 
 class ReasoningStep(BaseModel):

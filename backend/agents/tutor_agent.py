@@ -12,7 +12,10 @@ from retrieval.rag import retrieve_from_wiki
 
 def _parse_json(text: str, fallback: dict) -> dict:
     """Extract first JSON object from text, return fallback on failure."""
-    clean = re.sub(r"```(?:json)?", "", text).strip()
+    # Strip thinking blocks before searching for JSON
+    clean = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.DOTALL)
+    clean = re.sub(r"<think(?:ing)?>.*$", "", clean, flags=re.DOTALL)
+    clean = re.sub(r"```(?:json)?", "", clean).strip()
     match = re.search(r'\{.*\}', clean, re.DOTALL)
     if match:
         try:
@@ -38,10 +41,9 @@ QUESTION_PROMPT = """Wiki content for this concept:
 
 All known concepts: {known_concepts}
 
-Generate ONE Socratic exam question about "{concept}" that:
-- Tests deep understanding, not just recall
-- Can be answered from the wiki content above
-- Is specific and unambiguous
+Generate ONE short Socratic question about "{concept}" that:
+- Is under 15 words
+- Tests understanding, not just recall
 - Ends with a question mark
 
 Return ONLY the question. No preamble."""
@@ -52,6 +54,14 @@ ASSESS_PROMPT = """Wiki content:
 Question asked: {question}
 Ideal answer (from wiki): {ideal_clues}
 Student answered: {student_answer}
+
+Scoring rules — be strict:
+- "strong"  = correct and complete answer using the right concepts
+- "partial" = shows SOME relevant knowledge but misses key details
+- "missed"  = wrong, vague, nonsensical, joke, or does not address the question at all
+
+Examples of "missed": "I don't know", "because I am dumb", "I have no idea", "idk", answers that are clearly unrelated.
+Examples of "partial": answer is in the right direction but lacks key specifics.
 
 Assess and return ONLY valid JSON:
 {{
@@ -111,16 +121,30 @@ async def generate_question(concept: str, session_concepts: list[str]) -> dict:
         wiki_content = "\n\n".join([c["text"] for c in chunks])
 
     prompt = QUESTION_PROMPT.format(
-        wiki_content=wiki_content[:2000],
+        wiki_content=wiki_content[:1500],
         known_concepts=", ".join(session_concepts),
         concept=concept
     )
-    question_text = await zai_complete(prompt, system=TUTOR_SYSTEM, max_tokens=100)
+    raw = await zai_complete(
+        prompt,
+        system=TUTOR_SYSTEM,
+        max_tokens=800,
+        temperature=0.3,
+        model="minimax-m2"
+    )
+    # Extract just the question sentence
+    questions = re.findall(r'[^.!?\n]+\?', raw)
+    question_text = questions[-1].strip() if questions else raw.strip()
+    # Safety fallback — never return an empty question
+    if not question_text:
+        question_text = f"Can you explain the key mechanism behind {concept}?"
     return {
         "id": str(uuid.uuid4())[:8],
         "concept": concept,
-        "text": question_text.strip(),
-        "wiki_content": wiki_content[:1000]
+        "text": question_text,
+        "wiki_content": wiki_content[:1000],
+        "is_main": True,
+        "is_followup": False,
     }
 
 
@@ -135,7 +159,8 @@ async def assess_answer(question: dict, student_answer: str) -> dict:
     response = await zai_complete(
         prompt,
         system="You are a precise assessor. Return only valid JSON.",
-        max_tokens=250
+        max_tokens=500,
+        strip=False,
     )
     return _parse_json(response, {
         "score": "partial",
